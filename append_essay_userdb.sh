@@ -49,7 +49,8 @@ sample_entries() {
 # 1. 两字及以上：纯汉字、c>0，无次数门槛
 # 2. 单字：纯汉字、c>0、c≥20 高频门槛才保留
 # 3. c使用对数压缩，超高次数不会让分数过度膨胀
-# 4. 新增score保底，杜绝0分入库
+# 4. 新增词长增益：字数越长附加权重越高，弥补长词使用频次低
+# 5. score保底最低43，杜绝0分入库
 # 计分逻辑统一，老词衰减最低0.3不归零
 extract_valid_rime_words() {
     local db_path="$1"
@@ -92,7 +93,9 @@ NF < 3 { next }
     }
     # 对c取对数，压制超大c的权重膨胀
     c_compress = log(c_val + 1)
-    raw = c_compress * d_val * decay
+    # 词长增益：越长的词附加权重越高，平衡长词使用次数少的劣势
+    len_bonus = 1 + log(word_len)
+    raw = c_compress * d_val * decay * len_bonus
     score = int(log(raw + 1) * 120)
     # 保底最低43，杜绝低分/0分词条
     if (score < 43) score = 43
@@ -156,7 +159,7 @@ echo "Rime词库提取有效词条：$NEW_RIME_COUNT 条"
 echo "繁体子模块基底总行数：$T_SUB_LINES 条"
 echo "简体子模块基底总行数：$S_SUB_LINES 条"
 echo "单字高频门槛：累计选用次数 ≥ 20"
-echo "分数规则：衰减最低0.3，词条score保底1，无0分"
+echo "分数规则：衰减最低0.3，词长越长附加权重越高，词条score保底43，无0分"
 echo "词条样例展示规则：均匀采样，固定输出最多15条"
 
 echo -e "\n🔍 Rime新增词条均匀采样样例（最多15条）"
