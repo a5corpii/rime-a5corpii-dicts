@@ -20,7 +20,7 @@
 name: luna_pinyin.shenglvqimeng
 version: "2021.11.17"
 sort: by_weight
-use_preset_vocabulary: true
+use_preset_vocabulary: false
 ...
 
 一東

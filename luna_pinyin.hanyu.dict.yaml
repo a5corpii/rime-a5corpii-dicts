@@ -22,7 +22,7 @@
 name: luna_pinyin.hanyu
 version: "2019.07.05"
 sort: by_weight
-use_preset_vocabulary: true
+use_preset_vocabulary: false
 ...
 
 一一行行

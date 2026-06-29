@@ -2,16 +2,20 @@
 
 ## 使用
 
-將`a5corpii/rime-a5corpii-dicts`寫入[東風破](https://github.com:rime/plum)配置文件`preset-packages.conf`，
-安裝（make | make install）後使用。
+將`a5corpii/rime-a5corpii-dicts`寫入[東風破](https://github.com:rime/plum)
+配置文件`preset-packages.conf`， 安裝（make | make install）後使用。
 
 ## 詞庫介紹
 
-本詞庫分爲以下幾部分：
+本詞庫爲避免多次匯入八股（essay）產生詞條冗餘，將`use_preset_vocabulary`值統一
+賦爲`false`。
+
+分爲以下幾部分：
 
 ### RIME ACA詞庫
 
-主要是[Rime Academy](https://github.com/rime-aca/dictionaries)項目[擴充詞庫](https://github.com/rime-aca/dictionaries)，包括：
+主要是[Rime Academy](https://github.com/rime-aca/dictionaries)項目
+[擴充詞庫](https://github.com/rime-aca/dictionaries)，包括：
 
 - luna_pinyin.aca-ext.dict.yaml
 - luna_pinyin.hanyu.dict.yaml
