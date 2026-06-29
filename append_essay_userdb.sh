@@ -19,6 +19,8 @@ BLACKLIST_TMP_S="./.blacklist_s.tmp"
 SUBMODULE_STAMP="./.submodule_last_update.stamp"
 # 30天秒数阈值
 THIRTY_DAY_SEC=$((30 * 24 * 86400))
+# 全局分数硬上限，防止出现百万级超大权重
+MAX_SCORE=3890
 
 # -------------------------- 通用工具函数 --------------------------
 # 统计文件行数
@@ -112,7 +114,13 @@ NF < 3 { next }
 }' "$db_path"
 }
 
-# 合并数据源、剔除黑名单、排序去重
+# 统一截断分数至MAX_SCORE上限
+clip_max_score() {
+    local limit="$1"
+    awk -F'\t' -v max="$limit" '{if($2>max)$2=max;print $1"\t"$2}'
+}
+
+# 合并数据源、剔除黑名单、截断超大分数、排序去重
 # $1子模块基底 $2原有词库 $3Rime新词流 $4黑名单文件 $5输出临时文件
 merge_stream_dedup() {
     local submod_file="$1"
@@ -128,10 +136,10 @@ merge_stream_dedup() {
 
     if [ "$bl_cnt" -gt 0 ]; then
         # 存在黑名单，反向匹配删除词条
-        grep -v -f "$bl_file" .merge_all.tmp | sort -k1,1 -k2,2nr | awk '!seen[$1]++' > "$tmp_out"
+        grep -v -f "$bl_file" .merge_all.tmp | clip_max_score "$MAX_SCORE" | sort -k1,1 -k2,2nr | awk '!seen[$1]++' > "$tmp_out"
     else
-        # 无黑名单，直接排序去重，不会清空
-        sort -k1,1 -k2,2nr .merge_all.tmp | awk '!seen[$1]++' > "$tmp_out"
+        # 无黑名单，直接截断高分+排序去重，不会清空
+        clip_max_score "$MAX_SCORE" .merge_all.tmp | sort -k1,1 -k2,2nr | awk '!seen[$1]++' > "$tmp_out"
     fi
 
     rm -f .merge_all.tmp
@@ -167,7 +175,7 @@ merge_stream_dedup "$SUBMOD_T_BASE" "$EssayHanT" "$NEW_RAW_RIME" "$BLACKLIST_TMP
 T_NEW=$(count_lines "$EssayHanT")
 T_SUB_LINES=$(count_lines "$SUBMOD_T_BASE")
 T_DEL=$(( T_SUB_LINES + T_OLD + NEW_RIME_COUNT - T_NEW ))
-echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，合并去重+黑名单拦截共剔除 $T_DEL 条"
+echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+高分截断+去重共剔除 $T_DEL 条"
 
 # -------------------------- 处理简体词库 --------------------------
 echo -e "\n===== 处理简体词库 ====="
@@ -176,7 +184,7 @@ merge_stream_dedup "$SUBMOD_S_BASE" "$EssayHanS" "$NEW_SIMP_RIME" "$BLACKLIST_TM
 S_NEW=$(count_lines "$EssayHanS")
 S_SUB_LINES=$(count_lines "$SUBMOD_S_BASE")
 S_DEL=$(( S_SUB_LINES + S_OLD + NEW_RIME_COUNT - S_NEW ))
-echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，合并去重+黑名单拦截共剔除 $S_DEL 条"
+echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+高分截断+去重共剔除 $S_DEL 条"
 
 # 清理临时黑名单
 rm -f "$BLACKLIST_TMP_T" "$BLACKLIST_TMP_S"
@@ -189,7 +197,10 @@ echo "繁体子模块基底总行数：$T_SUB_LINES 条"
 echo "简体子模块基底总行数：$S_SUB_LINES 条"
 echo "单字高频门槛：累计选用次数 ≥ 20"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
-echo "分数规则：衰减最低0.3，线性平缓词长加成抑制高分爆炸，词条score保底43，无0分"
+echo "分数分层规则："
+echo "  1. Rime词条最低保底43；"
+echo "  2. 线性平缓词长增益，抑制原生分数膨胀；"
+echo "  3. 全局硬上限3890，所有词条分数不超过3890，杜绝百万级超大权重；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
 echo "词条样例展示规则：均匀采样，固定输出最多15条"
 
