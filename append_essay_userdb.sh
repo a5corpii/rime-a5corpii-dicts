@@ -83,7 +83,9 @@ extract_valid_rime_words() {
     awk -F'\t' '
 BEGIN {
     now = systime()
+    # 单字词频门槛下调至20
     SINGLE_WORD_C_THRESHOLD = 20
+    MIN_BASE_SCORE = 43
 }
 /^#/ { next }
 NF < 3 { next }
@@ -95,21 +97,40 @@ NF < 3 { next }
     d_val = substr(field_arr[2], 3) + 0
     t_val = substr(field_arr[3], 3) + 0
 
-    if (word !~ /^[\u4E00-\u2A6DF]+$/ || c_val <= 0) next
-    if (word_len == 1 && c_val < SINGLE_WORD_C_THRESHOLD) next
+    # 基础前置过滤：必须全汉字、c>0
+    if (word !~ /^[\u4E00-\u2A6DF]+$/ || c_val <= 0) {
+        next
+    }
 
+    # 分支规则：区分单字 / 多字词
+    if (word_len == 1) {
+        # 单字额外限制：累计选用次数≥20才保留
+        if (c_val < SINGLE_WORD_C_THRESHOLD) {
+            next
+        }
+    }
+    # word_len ≥2 无额外限制，直接放行
+
+    # 不参与衰减的原始基础复合值
+    c_compress = log(c_val + 1)
+    len_bonus = 1 + (word_len - 2) * 0.12
+    raw_base = c_compress * d_val * len_bonus
+
+    # 时间衰减逻辑
     day_diff = (now - t_val) / 86400
     decay = 1
     if (day_diff > 30) {
         decay = exp(-(day_diff - 30) / 180)
         if (decay < 0.3) decay = 0.3
     }
+    raw_decay = raw_base * decay
 
-    c_compress = log(c_val + 1)
-    len_bonus = 1 + (word_len - 2) * 0.12
-    raw = c_compress * d_val * decay * len_bonus
-    score = int(log(raw + 1) * 120)
-    if (score < 43) score = 43
+    # 核心修改：衰减后低于43则用未衰减原值，避免老词过度压低分数
+    raw_final = (raw_decay < MIN_BASE_SCORE) ? raw_base : raw_decay
+
+    score = int(log(raw_final + 1) * 120)
+    # 最终输出保底43
+    if (score < MIN_BASE_SCORE) score = MIN_BASE_SCORE
     print word "\t" score
 }' "$db_path"
 }
@@ -198,8 +219,8 @@ echo "简体子模块基底总行数：$S_SUB_LINES 条"
 echo "单字高频门槛：累计选用次数 ≥ 20"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
-echo "  1. Rime词条最低保底43；"
-echo "  2. 线性平缓词长增益，抑制原生分数膨胀；"
+echo "  1. 衰减后复合值低于43时，使用无衰减原始分值，避免老词条权重过低；"
+echo "  2. Rime词条最终输出保底43；线性平缓词长增益抑制原生分数膨胀；"
 echo "  3. 全局硬上限3890，所有词条分数不超过3890，杜绝百万级超大权重；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
 echo "词条样例展示规则：均匀采样，固定输出最多15条"
