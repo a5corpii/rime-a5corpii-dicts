@@ -125,8 +125,12 @@ NF < 3 { next }
     }
     raw_decay = raw_base * decay
 
-    # 核心修改：衰减后低于43则用未衰减原值，避免老词过度压低分数
-    raw_final = (raw_decay < MIN_BASE_SCORE) ? raw_base : raw_decay
+    # 修复规则：仅原生基准分充足、仅衰减导致过低时，取消衰减；原生低分正常衰减
+    if (raw_decay < MIN_BASE_SCORE && raw_base >= MIN_BASE_SCORE) {
+        raw_final = raw_base
+    } else {
+        raw_final = raw_decay
+    }
 
     score = int(log(raw_final + 1) * 120)
     # 最终输出保底43
@@ -219,7 +223,7 @@ echo "简体子模块基底总行数：$S_SUB_LINES 条"
 echo "单字高频门槛：累计选用次数 ≥ 20"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
-echo "  1. 衰减后复合值低于43时，使用无衰减原始分值，避免老词条权重过低；"
+echo "  1. 仅词条原生基础复合值≥43、单纯因老化衰减导致数值低于43时，取消衰减使用原始分值；原生低频低分正常参与衰减；"
 echo "  2. Rime词条最终输出保底43；线性平缓词长增益抑制原生分数膨胀；"
 echo "  3. 全局硬上限3890，所有词条分数不超过3890，杜绝百万级超大权重；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
