@@ -1,28 +1,39 @@
 #!/bin/bash
 
 # -------------------------- 文件变量命名区 --------------------------
+
 # Rime 配置文件，读取installation_id
 RIME_Instl="$HOME/.local/share/fcitx5/rime/installation.yaml"
-# 输出词库
+
+# 输出词库 essay‑*.txt 格式：字词\t权重 两列tab分隔
 EssayHanT="./essay-a5corpii.txt"
 EssayHanS="./essay-hans-a5corpii.txt"
+
 # 繁体子模块
 SUBMOD_T_DIR="./rime-essay"
 SUBMOD_T_BASE="${SUBMOD_T_DIR}/essay.txt"
+
 # 简体子模块
 SUBMOD_S_DIR="./rime-essay-simp"
 SUBMOD_S_BASE="${SUBMOD_S_DIR}/essay-zh-hans.txt"
+
 # 临时黑名单文件
 BLACKLIST_TMP_T="./.blacklist_t.tmp"
 BLACKLIST_TMP_S="./.blacklist_s.tmp"
+
 # 子模块更新时间戳标记文件
 SUBMODULE_STAMP="./.submodule_last_update.stamp"
+
 # 30天秒数阈值
 THIRTY_DAY_SEC=$((30 * 24 * 86400))
+
 # 全局分数硬上限，防止出现百万级超大权重
 MAX_SCORE=3890
+MIN_BASE_SCORE=43
+SINGLE_WORD_C_THRESHOLD=10
 
 # -------------------------- 通用工具函数 --------------------------
+
 # 统计文件行数
 count_lines() {
     [ -f "$1" ] && wc -l < "$1" || echo 0
@@ -78,14 +89,13 @@ extract_negative_c_blacklist() {
 }
 
 # 提取Rime合规繁体词条
+# 【已移除时间衰减逻辑：不因长期不使用降权】
 extract_valid_rime_words() {
     local db_path="$1"
     awk -F'\t' '
 BEGIN {
-    now = systime()
-    # 单字词频门槛下调至20
-    SINGLE_WORD_C_THRESHOLD = 20
-    MIN_BASE_SCORE = 43
+    SINGLE_WORD_C_THRESHOLD = '"${SINGLE_WORD_C_THRESHOLD}"'
+    MIN_BASE_SCORE = '"${MIN_BASE_SCORE}"'
 }
 /^#/ { next }
 NF < 3 { next }
@@ -95,7 +105,6 @@ NF < 3 { next }
     split($3, field_arr, " ")
     c_val = substr(field_arr[1], 3) + 0
     d_val = substr(field_arr[2], 3) + 0
-    t_val = substr(field_arr[3], 3) + 0
 
     # 基础前置过滤：必须全汉字、c>0
     if (word !~ /^[\u4E00-\u2A6DF]+$/ || c_val <= 0) {
@@ -104,79 +113,85 @@ NF < 3 { next }
 
     # 分支规则：区分单字 / 多字词
     if (word_len == 1) {
-        # 单字额外限制：累计选用次数≥20才保留
+        # 单字额外限制：累计选用次数≥10才保留
         if (c_val < SINGLE_WORD_C_THRESHOLD) {
             next
         }
     }
-    # word_len ≥2 无额外限制，直接放行
 
-    # 不参与衰减的原始基础复合值
+    # 不做时间衰减，直接原始复合分值
     c_compress = log(c_val + 1)
     len_bonus = 1 + (word_len - 2) * 0.12
-    raw_base = c_compress * d_val * len_bonus
-
-    # 时间衰减逻辑
-    day_diff = (now - t_val) / 86400
-    decay = 1
-    if (day_diff > 30) {
-        decay = exp(-(day_diff - 30) / 180)
-        if (decay < 0.3) decay = 0.3
-    }
-    raw_decay = raw_base * decay
-
-    # 修复规则：仅原生基准分充足、仅衰减导致过低时，取消衰减；原生低分正常衰减
-    if (raw_decay < MIN_BASE_SCORE && raw_base >= MIN_BASE_SCORE) {
-        raw_final = raw_base
-    } else {
-        raw_final = raw_decay
-    }
+    raw_final = c_compress * d_val * len_bonus
 
     score = int(log(raw_final + 1) * 120)
     # 最终输出保底43
     if (score < MIN_BASE_SCORE) score = MIN_BASE_SCORE
+
     print word "\t" score
 }' "$db_path"
 }
 
-# 统一截断分数至MAX_SCORE上限
+# 统一截断分数至MAX_SCORE上限，从标准输入读取，输出字词\t权重
 clip_max_score() {
     local limit="$1"
-    awk -F'\t' -v max="$limit" '{if($2>max)$2=max;print $1"\t"$2}'
+    awk -F'\t' -v max="$limit" '
+    NF>=2 && $2 ~ /^[0-9]+$/ {
+        if($2>max) $2 = max
+    }
+    {print $1"\t"$2}
+    '
 }
 
-# 合并数据源、剔除黑名单、截断超大分数、排序去重
+# merge_stream_dedup
 # $1子模块基底 $2原有词库 $3Rime新词流 $4黑名单文件 $5输出临时文件
+# 逻辑：合并子模块 + 旧词库 + rime新词；同词条**保留权重最大值**；黑名单过滤；子模块删除词条会同步消失
 merge_stream_dedup() {
     local submod_file="$1"
     local user_file="$2"
     local rime_stream="$3"
     local bl_file="$4"
     local tmp_out="$5"
+
     local bl_cnt=$(count_lines "$bl_file")
 
-    # 合并全部原始数据源
-    cat "$submod_file" "$user_file" > .merge_all.tmp
-    echo "$rime_stream" >> .merge_all.tmp
+    # 全部数据源合并到临时流
+    {
+        cat "$submod_file" "$user_file"
+        echo "$rime_stream"
+    } > .merge_all.tmp
+
+    # awk：同词条取最大权重
+    awk -F'\t' '
+    NF>=2 && $2~/^[0-9]+$/ {
+        if( (!max_score[$1]) || ($2 > max_score[$1]) ){
+            max_score[$1] = $2
+        }
+    }
+    END{
+        for(k in max_score){
+            print k "\t" max_score[k]
+        }
+    }' .merge_all.tmp > .merge_max.tmp
 
     if [ "$bl_cnt" -gt 0 ]; then
-        # 存在黑名单，反向匹配删除词条
-        grep -v -f "$bl_file" .merge_all.tmp | clip_max_score "$MAX_SCORE" | sort -k1,1 -k2,2nr | awk '!seen[$1]++' > "$tmp_out"
+        grep -v -f "$bl_file" .merge_max.tmp | clip_max_score "$MAX_SCORE" | sort -k1,1 > "$tmp_out"
     else
-        # 无黑名单，直接截断高分+排序去重，不会清空
-        clip_max_score "$MAX_SCORE" .merge_all.tmp | sort -k1,1 -k2,2nr | awk '!seen[$1]++' > "$tmp_out"
+        clip_max_score "$MAX_SCORE" < .merge_max.tmp | sort -k1,1 > "$tmp_out"
     fi
 
-    rm -f .merge_all.tmp
+    rm -f .merge_all.tmp .merge_max.tmp
     mv -f "$tmp_out" "$user_file"
 }
 
 # -------------------------- 前置流程 --------------------------
+
 update_all_submodules
 
 # 读取Rime同步配置
 INSTALL_ID=$(grep 'installation_id:' "$RIME_Instl" | sed 's/.*installation_id:\s*//')
-RIME_DB="$HOME/.local/share/fcitx5/rime/sync/${INSTALL_ID}/luna_pinyin.userdb.txt"
+RIME_DB="$HOME/.local/share/fcitx5/rime/sync/${INSTALL_ID}/terra_pinyin.userdb.txt"
+
 echo -e "\n📌 Rime环境信息"
 echo "installation_id：$INSTALL_ID"
 echo "用户词库路径：$RIME_DB"
@@ -185,6 +200,7 @@ echo "用户词库路径：$RIME_DB"
 echo -e "\n🔍 提取c为负值的待删除词条黑名单"
 extract_negative_c_blacklist "$RIME_DB" > "$BLACKLIST_TMP_T"
 cat "$BLACKLIST_TMP_T" | opencc -c t2s.json > "$BLACKLIST_TMP_S"
+
 BLACK_T_COUNT=$(count_lines "$BLACKLIST_TMP_T")
 echo "共识别需清除负c词条：${BLACK_T_COUNT} 条"
 
@@ -194,38 +210,42 @@ NEW_RIME_COUNT=$(echo "$NEW_RAW_RIME" | wc -l)
 NEW_SIMP_RIME=$(echo "$NEW_RAW_RIME" | opencc -c t2s.json)
 
 # -------------------------- 处理繁体词库 --------------------------
+
 echo -e "\n===== 处理繁体词库 ====="
 T_OLD=$(count_lines "$EssayHanT")
 merge_stream_dedup "$SUBMOD_T_BASE" "$EssayHanT" "$NEW_RAW_RIME" "$BLACKLIST_TMP_T" "$EssayHanT.tmp"
 T_NEW=$(count_lines "$EssayHanT")
 T_SUB_LINES=$(count_lines "$SUBMOD_T_BASE")
 T_DEL=$(( T_SUB_LINES + T_OLD + NEW_RIME_COUNT - T_NEW ))
-echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+高分截断+去重共剔除 $T_DEL 条"
+echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+高分截断+按词条取最大权重共剔除 $T_DEL 条"
 
 # -------------------------- 处理简体词库 --------------------------
+
 echo -e "\n===== 处理简体词库 ====="
 S_OLD=$(count_lines "$EssayHanS")
 merge_stream_dedup "$SUBMOD_S_BASE" "$EssayHanS" "$NEW_SIMP_RIME" "$BLACKLIST_TMP_S" "$EssayHanS.tmp"
 S_NEW=$(count_lines "$EssayHanS")
 S_SUB_LINES=$(count_lines "$SUBMOD_S_BASE")
 S_DEL=$(( S_SUB_LINES + S_OLD + NEW_RIME_COUNT - S_NEW ))
-echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+高分截断+去重共剔除 $S_DEL 条"
+echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+高分截断+按词条取最大权重共剔除 $S_DEL 条"
 
 # 清理临时黑名单
 rm -f "$BLACKLIST_TMP_T" "$BLACKLIST_TMP_S"
 
 # -------------------------- 统计与样例输出 --------------------------
+
 echo -e "\n📊 整体统计信息"
 echo "Rime词库提取有效词条：$NEW_RIME_COUNT 条"
 echo "识别负c待删除词条总数：$BLACK_T_COUNT 条"
 echo "繁体子模块基底总行数：$T_SUB_LINES 条"
 echo "简体子模块基底总行数：$S_SUB_LINES 条"
-echo "单字高频门槛：累计选用次数 ≥ 20"
+echo "单字高频门槛：累计选用次数 ≥ ${SINGLE_WORD_C_THRESHOLD}"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
-echo "  1. 仅词条原生基础复合值≥43、单纯因老化衰减导致数值低于43时，取消衰减使用原始分值；原生低频低分正常参与衰减；"
-echo "  2. Rime词条最终输出保底43；线性平缓词长增益抑制原生分数膨胀；"
-echo "  3. 全局硬上限3890，所有词条分数不超过3890，杜绝百万级超大权重；"
+echo "  1. 已移除时间衰减逻辑，不会因为长期不使用降低词条权重；"
+echo "  2. Rime词条输出保底${MIN_BASE_SCORE}；线性平缓词长增益抑制原生分数膨胀；"
+echo "  3. 全局硬上限${MAX_SCORE}，所有词条分数不超过${MAX_SCORE}；"
+echo "  4. 存量词库与新词条同key保留权重较大值；子模块增删改同步到最终输出词库；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
 echo "词条样例展示规则：均匀采样，固定输出最多15条"
 
