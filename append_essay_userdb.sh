@@ -27,7 +27,7 @@ SUBMODULE_STAMP="./.submodule_last_update.stamp"
 # 30天秒数阈值
 THIRTY_DAY_SEC=$((30 * 24 * 86400))
 
-# 全局分数硬上限，防止出现百万级超大权重
+# 分数阈值
 MAX_SCORE=3890
 MIN_BASE_SCORE=43
 SINGLE_WORD_C_THRESHOLD=10
@@ -125,21 +125,31 @@ NF < 3 { next }
     raw_final = c_compress * d_val * len_bonus
 
     score = int(log(raw_final + 1) * 120)
-    # 最终输出保底43
-    if (score < MIN_BASE_SCORE) score = MIN_BASE_SCORE
-
     print word "\t" score
 }' "$db_path"
 }
 
-# 统一截断分数至MAX_SCORE上限，从标准输入读取，输出字词\t权重
+# 分数修剪：处理最终essay txt两列格式
+# 规则：
+#  1.无权重、权重非数字、权重<43 → 强制43
+#  2.权重>3890 → 强制3890
+#  3.43~3890原值保留
 clip_max_score() {
     local limit="$1"
-    awk -F'\t' -v max="$limit" '
-    NF>=2 && $2 ~ /^[0-9]+$/ {
-        if($2>max) $2 = max
+    local min="$2"
+    awk -F'\t' -v max="$limit" -v min="$min" '
+    {
+        word=$1
+        val=$2
+        # 条件：字段不足2列 / 第二列不是数字 / 数值小于min
+        if(NF<2 || val !~ /^[0-9]+$/ || val < min){
+            printf("%s\t%d\n", word, min)
+        }else if(val > max){
+            printf("%s\t%d\n", word, max)
+        }else{
+            print $1"\t"$2
+        }
     }
-    {print $1"\t"$2}
     '
 }
 
@@ -175,9 +185,9 @@ merge_stream_dedup() {
     }' .merge_all.tmp > .merge_max.tmp
 
     if [ "$bl_cnt" -gt 0 ]; then
-        grep -v -f "$bl_file" .merge_max.tmp | clip_max_score "$MAX_SCORE" | sort -k1,1 > "$tmp_out"
+        grep -v -f "$bl_file" .merge_max.tmp | clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" | sort -k1,1 > "$tmp_out"
     else
-        clip_max_score "$MAX_SCORE" < .merge_max.tmp | sort -k1,1 > "$tmp_out"
+        clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" < .merge_max.tmp | sort -k1,1 > "$tmp_out"
     fi
 
     rm -f .merge_all.tmp .merge_max.tmp
@@ -188,7 +198,7 @@ merge_stream_dedup() {
 
 update_all_submodules
 
-# 读取Rime同步配置
+# 读取Rime同步配置，使用 terra_pinyin.userdb.txt
 INSTALL_ID=$(grep 'installation_id:' "$RIME_Instl" | sed 's/.*installation_id:\s*//')
 RIME_DB="$HOME/.local/share/fcitx5/rime/sync/${INSTALL_ID}/terra_pinyin.userdb.txt"
 
@@ -217,7 +227,7 @@ merge_stream_dedup "$SUBMOD_T_BASE" "$EssayHanT" "$NEW_RAW_RIME" "$BLACKLIST_TMP
 T_NEW=$(count_lines "$EssayHanT")
 T_SUB_LINES=$(count_lines "$SUBMOD_T_BASE")
 T_DEL=$(( T_SUB_LINES + T_OLD + NEW_RIME_COUNT - T_NEW ))
-echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+高分截断+按词条取最大权重共剔除 $T_DEL 条"
+echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+分数修剪+按词条取最大权重共剔除 $T_DEL 条"
 
 # -------------------------- 处理简体词库 --------------------------
 
@@ -227,7 +237,7 @@ merge_stream_dedup "$SUBMOD_S_BASE" "$EssayHanS" "$NEW_SIMP_RIME" "$BLACKLIST_TM
 S_NEW=$(count_lines "$EssayHanS")
 S_SUB_LINES=$(count_lines "$SUBMOD_S_BASE")
 S_DEL=$(( S_SUB_LINES + S_OLD + NEW_RIME_COUNT - S_NEW ))
-echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+高分截断+按词条取最大权重共剔除 $S_DEL 条"
+echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+分数修剪+按词条取最大权重共剔除 $S_DEL 条"
 
 # 清理临时黑名单
 rm -f "$BLACKLIST_TMP_T" "$BLACKLIST_TMP_S"
@@ -243,9 +253,8 @@ echo "单字高频门槛：累计选用次数 ≥ ${SINGLE_WORD_C_THRESHOLD}"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
 echo "  1. 已移除时间衰减逻辑，不会因为长期不使用降低词条权重；"
-echo "  2. Rime词条输出保底${MIN_BASE_SCORE}；线性平缓词长增益抑制原生分数膨胀；"
-echo "  3. 全局硬上限${MAX_SCORE}，所有词条分数不超过${MAX_SCORE}；"
-echo "  4. 存量词库与新词条同key保留权重较大值；子模块增删改同步到最终输出词库；"
+echo "  2. 最终txt输出：无权重/权重非数字/权重＜43 →强制43；权重＞3890→强制3890；中间原值保留"
+echo "  3. 存量词库与新词条同key保留权重较大值；子模块增删改同步到最终输出词库；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
 echo "词条样例展示规则：均匀采样，固定输出最多15条"
 
