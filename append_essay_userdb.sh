@@ -26,11 +26,14 @@ SUBMODULE_STAMP="./.submodule_last_update.stamp"
 
 # 30天秒数阈值
 THIRTY_DAY_SEC=$((30 * 24 * 86400))
+ONE_MONTH_SEC=$((30 * 24 * 86400))
 
 # 分数阈值
 MAX_SCORE=3890
 MIN_BASE_SCORE=43
-SINGLE_WORD_C_THRESHOLD=10
+# 筛选门槛：单字 c>1；多字 c>0
+SINGLE_C_THRESHOLD=1
+MULTI_C_THRESHOLD=0
 
 # -------------------------- 通用工具函数 --------------------------
 
@@ -88,13 +91,14 @@ extract_negative_c_blacklist() {
     }' "$db_path"
 }
 
-# 提取Rime合规繁体词条
-# 【已移除时间衰减逻辑：不因长期不使用降权】
+# 提取Rime合规词条
+# 规则：单字c>1；多字c>0；7天阻尼防短时爆炸；30d平滑衰减
 extract_valid_rime_words() {
     local db_path="$1"
-    awk -F'\t' '
+    local now_ts=$(date +%s)
+    awk -F'\t' -v now="${now_ts}" -v month_sec="${ONE_MONTH_SEC}" \
+        -v s_c_thr="${SINGLE_C_THRESHOLD}" -v m_c_thr="${MULTI_C_THRESHOLD}" '
 BEGIN {
-    SINGLE_WORD_C_THRESHOLD = '"${SINGLE_WORD_C_THRESHOLD}"'
     MIN_BASE_SCORE = '"${MIN_BASE_SCORE}"'
 }
 /^#/ { next }
@@ -103,28 +107,60 @@ NF < 3 { next }
     word = $2
     word_len = length(word)
     split($3, field_arr, " ")
+
     c_val = substr(field_arr[1], 3) + 0
     d_val = substr(field_arr[2], 3) + 0
-
-    # 基础前置过滤：必须全汉字、c>0
-    if (word !~ /^[\u4E00-\u2A6DF]+$/ || c_val <= 0) {
-        next
-    }
-
-    # 分支规则：区分单字 / 多字词
-    if (word_len == 1) {
-        # 单字额外限制：累计选用次数≥10才保留
-        if (c_val < SINGLE_WORD_C_THRESHOLD) {
-            next
+    t_val = 0
+    # 解析t=时间戳
+    for(f in field_arr){
+        if(field_arr[f] ~ /^t=/){
+            t_val = substr(field_arr[f],3) + 0
         }
     }
 
-    # 不做时间衰减，直接原始复合分值
+    # 必须全汉字
+    if (word !~ /^[\u4E00-\u2A6DF]+$/ ) {
+        next
+    }
+
+    # 分支判断：单字 / 多字门槛不同
+    keep = 0
+    if(word_len == 1){
+        if(c_val > s_c_thr){
+            keep = 1
+        }
+    }else{
+        if(c_val > m_c_thr){
+            keep = 1
+        }
+    }
+    if(keep == 0){
+        next
+    }
+
+    # 时间差计算
+    delta_t = (now - t_val)
+    if(delta_t < 0) delta_t = 0
+
+    # 短时爆发抑制：7天内高频使用做阻尼，防止短时间刷爆权重
+    local_damp = 1.0
+    if(delta_t < 7*24*86400){
+        local_damp = 0.25 + 0.75 * (delta_t/(7*24*86400))
+    }
+
+    # 按月平滑衰减系数：满一个月开始缓慢衰减，最小衰减系数0.4
+    decay_factor = 1.0
+    if(delta_t > month_sec){
+        decay_factor = 1.0 - 0.35 * ((delta_t - month_sec) / (3.0 * month_sec))
+        if(decay_factor < 0.4) decay_factor = 0.4
+    }
+
     c_compress = log(c_val + 1)
     len_bonus = 1 + (word_len - 2) * 0.12
-    raw_final = c_compress * d_val * len_bonus
 
+    raw_final = c_compress * d_val * len_bonus * local_damp * decay_factor
     score = int(log(raw_final + 1) * 120)
+
     print word "\t" score
 }' "$db_path"
 }
@@ -162,7 +198,6 @@ merge_stream_dedup() {
     local rime_stream="$3"
     local bl_file="$4"
     local tmp_out="$5"
-
     local bl_cnt=$(count_lines "$bl_file")
 
     # 全部数据源合并到临时流
@@ -210,7 +245,6 @@ echo "用户词库路径：$RIME_DB"
 echo -e "\n🔍 提取c为负值的待删除词条黑名单"
 extract_negative_c_blacklist "$RIME_DB" > "$BLACKLIST_TMP_T"
 cat "$BLACKLIST_TMP_T" | opencc -c t2s.json > "$BLACKLIST_TMP_S"
-
 BLACK_T_COUNT=$(count_lines "$BLACKLIST_TMP_T")
 echo "共识别需清除负c词条：${BLACK_T_COUNT} 条"
 
@@ -220,7 +254,6 @@ NEW_RIME_COUNT=$(echo "$NEW_RAW_RIME" | wc -l)
 NEW_SIMP_RIME=$(echo "$NEW_RAW_RIME" | opencc -c t2s.json)
 
 # -------------------------- 处理繁体词库 --------------------------
-
 echo -e "\n===== 处理繁体词库 ====="
 T_OLD=$(count_lines "$EssayHanT")
 merge_stream_dedup "$SUBMOD_T_BASE" "$EssayHanT" "$NEW_RAW_RIME" "$BLACKLIST_TMP_T" "$EssayHanT.tmp"
@@ -230,7 +263,6 @@ T_DEL=$(( T_SUB_LINES + T_OLD + NEW_RIME_COUNT - T_NEW ))
 echo "✅ 繁体库完成：$T_OLD 行 → $T_NEW 行，黑名单过滤+分数修剪+按词条取最大权重共剔除 $T_DEL 条"
 
 # -------------------------- 处理简体词库 --------------------------
-
 echo -e "\n===== 处理简体词库 ====="
 S_OLD=$(count_lines "$EssayHanS")
 merge_stream_dedup "$SUBMOD_S_BASE" "$EssayHanS" "$NEW_SIMP_RIME" "$BLACKLIST_TMP_S" "$EssayHanS.tmp"
@@ -243,16 +275,15 @@ echo "✅ 简体库完成：$S_OLD 行 → $S_NEW 行，黑名单过滤+分数�
 rm -f "$BLACKLIST_TMP_T" "$BLACKLIST_TMP_S"
 
 # -------------------------- 统计与样例输出 --------------------------
-
 echo -e "\n📊 整体统计信息"
 echo "Rime词库提取有效词条：$NEW_RIME_COUNT 条"
 echo "识别负c待删除词条总数：$BLACK_T_COUNT 条"
 echo "繁体子模块基底总行数：$T_SUB_LINES 条"
 echo "简体子模块基底总行数：$S_SUB_LINES 条"
-echo "单字高频门槛：累计选用次数 ≥ ${SINGLE_WORD_C_THRESHOLD}"
+echo "词条筛选门槛：单字 c>1(c≥2)；多字 c>0(c≥1)"
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
-echo "  1. 已移除时间衰减逻辑，不会因为长期不使用降低词条权重；"
+echo "  1. 引入时间阻尼：7天内高频输入抑制权重爆炸；超过30天平滑衰减；衰减后输出保底43，上限3890"
 echo "  2. 最终txt输出：无权重/权重非数字/权重＜43 →强制43；权重＞3890→强制3890；中间原值保留"
 echo "  3. 存量词库与新词条同key保留权重较大值；子模块增删改同步到最终输出词库；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
