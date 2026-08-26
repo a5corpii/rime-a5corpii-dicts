@@ -1,32 +1,23 @@
 #!/bin/bash
-
 # -------------------------- 文件变量命名区 --------------------------
-
 # Rime 配置文件，读取installation_id
 RIME_Instl="$HOME/.local/share/fcitx5/rime/installation.yaml"
-
 # 输出词库 essay‑*.txt 格式：字词\t权重 两列tab分隔
 EssayHanT="./essay-a5corpii.txt"
 EssayHanS="./essay-hans-a5corpii.txt"
-
 # 繁体子模块
 SUBMOD_T_DIR="./rime-essay"
 SUBMOD_T_BASE="${SUBMOD_T_DIR}/essay.txt"
-
 # 简体子模块
 SUBMOD_S_DIR="./rime-essay-simp"
 SUBMOD_S_BASE="${SUBMOD_S_DIR}/essay-zh-hans.txt"
-
 # 临时黑名单文件
 BLACKLIST_TMP_T="./.blacklist_t.tmp"
 BLACKLIST_TMP_S="./.blacklist_s.tmp"
-
 # 子模块更新时间戳标记文件
 SUBMODULE_STAMP="./.submodule_last_update.stamp"
-
 # 30天秒数阈值
 THIRTY_DAY_SEC=$((30 * 24 * 86400))
-
 # 分数阈值
 MAX_SCORE=3890
 MIN_BASE_SCORE=43
@@ -35,7 +26,6 @@ SINGLE_C_THRESHOLD=1
 MULTI_C_THRESHOLD=0
 
 # -------------------------- 通用工具函数 --------------------------
-
 count_lines() {
     [ -f "$1" ] && wc -l < "$1" || echo 0
 }
@@ -96,16 +86,10 @@ extract_valid_rime_words() {
     local now_ts=$(date +%s)
     awk -F'\t' -v now="${now_ts}" -v month_sec="${THIRTY_DAY_SEC}" \
         -v s_c_thr="${SINGLE_C_THRESHOLD}" -v m_c_thr="${MULTI_C_THRESHOLD}" '
-BEGIN {
-    MIN_BASE_SCORE = '"${MIN_BASE_SCORE}"'
-}
-/^#/ { next }
-NF < 3 { next }
 {
     word = $2
     word_len = length(word)
     split($3, field_arr, " ")
-
     c_val = substr(field_arr[1], 3) + 0
     d_val = substr(field_arr[2], 3) + 0
     t_val = 0
@@ -114,12 +98,10 @@ NF < 3 { next }
             t_val = substr(field_arr[f],3) + 0
         }
     }
-
     # 过滤：只看汉字校验 + c门槛；t不参与词条去留判断
     if (word !~ /^[\u4E00-\u2A6DF]+$/ ) {
         next
     }
-
     keep = 0
     if(word_len == 1){
         if(c_val > s_c_thr){
@@ -133,16 +115,13 @@ NF < 3 { next }
     if(keep == 0){
         next
     }
-
     delta_t = (now - t_val)
     if(delta_t < 0) delta_t = 0
-
     # 7天短时阻尼：抑制短时间大量重复输入造成权重爆炸
     local_damp = 1.0
     if(delta_t < 7*24*86400){
         local_damp = 0.4 + 0.6 * (delta_t/(7*24*86400))
     }
-
     # --------时间衰减逻辑修改----------
     # 30天以内完全不衰减，decay_factor固定1.0；超过30天才启动衰减
     decay_factor = 1.0
@@ -151,17 +130,15 @@ NF < 3 { next }
         decay_factor = 1.0 - 0.20 * ((delta_t - month_sec) / (3.0 * month_sec))
         if(decay_factor < 0.7) decay_factor = 0.7
     }
-
     c_compress = log(c_val + 1)
     len_bonus = 1 + (word_len - 2) * 0.12
-
     raw_final = c_compress * d_val * len_bonus * local_damp * decay_factor
     score = int(log(raw_final + 1) * 120)
-
     print word "\t" score
 }' "$db_path"
 }
 
+# 权重钳位：强制 [MIN, MAX]
 clip_max_score() {
     local limit="$1"
     local min="$2"
@@ -188,9 +165,27 @@ merge_stream_dedup() {
     local tmp_out="$5"
     local bl_cnt=$(count_lines "$bl_file")
 
+    # =========修复：全部来源先做权重钳位，再合并=========
+    # 1.子模块原始库先clip
+    clip_submod=$(mktemp .submod_clip.XXXXXX.tmp)
+    clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" < "$submod_file" > "$clip_submod"
+
+    # 2.旧user词库先clip
+    clip_user=$(mktemp .user_clip.XXXXXX.tmp)
+    if [ -f "$user_file" ]; then
+        clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" < "$user_file" > "$clip_user"
+    else
+        touch "$clip_user"
+    fi
+
+    # 3.rime输出流源头clip
+    clip_rime=$(mktemp .rime_clip.XXXXXX.tmp)
+    echo "$rime_stream" | clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" > "$clip_rime"
+
     {
-        cat "$submod_file" "$user_file"
-        echo "$rime_stream"
+        cat "$clip_submod"
+        cat "$clip_user"
+        cat "$clip_rime"
     } > .merge_all.tmp
 
     awk -F'\t' '
@@ -206,26 +201,30 @@ merge_stream_dedup() {
     }' .merge_all.tmp > .merge_max.tmp
 
     if [ "$bl_cnt" -gt 0 ]; then
-        grep -v -f "$bl_file" .merge_max.tmp | clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" | sort -k1,1 > "$tmp_out"
+        grep -v -f "$bl_file" .merge_max.tmp | sort -k1,1 > "$tmp_out"
     else
-        clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" < .merge_max.tmp | sort -k1,1 > "$tmp_out"
+        sort -k1,1 .merge_max.tmp > "$tmp_out"
     fi
 
-    rm -f .merge_all.tmp .merge_max.tmp
+    # 兜底二次clip，万无一失
+    mv "$tmp_out" "${tmp_out}.preclip"
+    clip_max_score "$MAX_SCORE" "$MIN_BASE_SCORE" < "${tmp_out}.preclip" > "$tmp_out"
+    rm -f "${tmp_out}.preclip"
+
+    # 清理临时文件
+    rm -f "$clip_submod" "$clip_user" "$clip_rime" .merge_all.tmp .merge_max.tmp
     mv -f "$tmp_out" "$user_file"
 }
 
 # -------------------------- 前置流程 --------------------------
-
 update_all_submodules
-
 INSTALL_ID=$(grep 'installation_id:' "$RIME_Instl" | sed 's/.*installation_id:\s*//')
-RIME_DB="$HOME/.local/share/fcitx5/rime/sync/${INSTALL_ID}/luna_pinyin.userdb.txt"
+# 已修改：terra_pinyin.userdb.txt
+RIME_DB="$HOME/.local/share/fcitx5/rime/sync/${INSTALL_ID}/terra_pinyin.userdb.txt"
 
 echo -e "\n📌 Rime环境信息"
 echo "installation_id：$INSTALL_ID"
 echo "用户词库路径：$RIME_DB"
-
 echo -e "\n🔍 提取c为负值的待删除词条黑名单"
 extract_negative_c_blacklist "$RIME_DB" > "$BLACKLIST_TMP_T"
 cat "$BLACKLIST_TMP_T" | opencc -c t2s.json > "$BLACKLIST_TMP_S"
@@ -267,7 +266,7 @@ echo "时间策略：30天内新词不做衰减；超过30天才缓慢衰减；c
 echo "子模块更新策略：30天内仅拉取一次，标记文件 .submodule_last_update.stamp"
 echo "分数分层规则："
 echo "  1.7天内短时阻尼抑制权重爆炸；满30天才开启衰减，衰减下限0.7，弱化时间对分数影响"
-echo "  2.最终txt输出：无权重/权重非数字/权重＜43 →强制43；权重＞3890→强制3890；中间原值保留"
+echo "  2.全部来源（子模块/旧输出库/rime用户库）统一前置钳位，输出强制：43 ≤ 权重 ≤3890"
 echo "  3.存量词库与新词条同key保留权重较大值；子模块增删改同步到最终输出词库；"
 echo "黑名单策略：空黑名单直接跳过过滤，彻底杜绝词库清空"
 
