@@ -5,28 +5,14 @@ set -o errexit
 # ==============================================================================
 # Rime 用户词库合并导出脚本
 # 输出格式 essay-*.txt：字词\t权重，Tab分隔，权重强制锁定 [43, 3890]
-# 需求说明：
-# 1.词条筛选：单字 c>1（c≥2）保留；多字词 c>0（c≥1）保留；c<=0丢弃；时间t只参与权重计算，不决定词条取舍
-# 2.时间衰减规则
-#    ·7天内新词条：短时阻尼，防止短时间高频输入造成权重爆炸
-#    ·30天内新词：decay_factor=1.0，不衰减
-#    ·超过30天缓慢衰减，衰减因子下限锁死0.7，频次c为主导，时间不能过度压低权重
-# 3.数据源：
-#    ①子模块基础词库 rime-essay（繁体） / rime-essay-simp（简体）
-#    ②上一轮脚本输出旧essay词库，同词条保留最大权重
-#    ③fcitx5-rime sync目录 terra_pinyin.userdb.txt 用户输入记录
-# 4.黑名单：提取userdb中c<0负频次词条，合并阶段过滤删除
-# 5.【子模块拉取冷却规则，本次修改核心】
-#      标记文件保存：上次【成功执行拉取】的Unix时间戳
-#      冷却周期固定30天：
-#        ①读取上次成功拉取时间戳；当前时间 < 上次拉取时间+30天 → 跳过拉取，标记文件不改动
-#        ②当前时间 ≥ 上次拉取时间+30天 → 执行git submodule update --remote拉取；拉取成功后，将标记时间戳更新为本次执行时间
-#        示例：首次拉取2026-09-01，9月所有执行均跳过；10月1日后执行，触发拉取；
-#              若10月10日拉取成功，则下一次允许拉取的最早时间=10-10+30天=11-09；10.10~11.09全部跳过。
-# 6.合并规则：多源合并去重，同词条保留最大权重；多次权重钳位兜底，保证权重不会跑出43~3890
-# 7.输出文件
-#    繁体：essay-a5corpii.txt
-#    简体：essay-hans-a5corpii.txt
+# 本次更新改动说明：
+# 1.长期衰减下限从0.7上调至0.72，最低保留峰值0.72倍，超过120天后不再继续衰减
+# 2.黑名单规则变更：
+#    词条c<0时：
+#      若词条存在于上游基底词库（essay.txt / dict.yaml来源），保留词条，不删除；
+#      不属于基底词库、c<0的用户自造词条，进入黑名单，最终剔除。
+# 3.衰减计算机制不变：每次执行脚本基于词条t_val与当前时间一次性计算总衰减，多次执行脚本不会重复叠加衰减
+# 4.子模块冷却规则：记录上次成功拉取时间戳，满30天才允许再次拉取，未到期多次执行仅跳过拉取，不修改时间戳
 # ==============================================================================
 
 # -------------------------- 全局变量定义区 --------------------------
@@ -55,6 +41,8 @@ MIN_BASE_SCORE=43
 # 词条筛选阈值
 SINGLE_C_THRESHOLD=1
 MULTI_C_THRESHOLD=0
+# 【修改点】长期衰减下限调整为0.72
+DECAY_FLOOR=0.72
 
 # -------------------------- 清理钩子函数 --------------------------
 # 只做兜底清理，不读取业务变量，避免变量未定义报错
@@ -95,13 +83,13 @@ count_lines() {
 }
 
 ## update_all_submodules
-# 【本次重写】子模块拉取冷却逻辑
+# 子模块拉取冷却逻辑
 # 规则：
 # 1.读取标记文件，获取上次成功拉取的时间戳；无标记文件=从未拉取，直接执行拉取
 # 2.计算：允许下次拉取的时间 = 上次拉取时间 + 30天
 # 3.当前时间 < 允许下次拉取时间 → 跳过拉取，标记文件保持原样不变
 # 4.当前时间 ≥ 允许下次拉取时间 → 执行git submodule update --remote拉取
-# 5.【关键】只有拉取命令执行成功之后，才把本次当前时间写入标记文件，更新冷却起点
+# 5.只有拉取命令执行成功之后，才把本次当前时间写入标记文件，更新冷却起点
 update_all_submodules() {
     local now=$(date +%s)
     local last_pull_ts=0
@@ -131,6 +119,43 @@ update_all_submodules() {
     echo "✅ 子模块拉取完成，已更新上次拉取时间戳为 $now"
 }
 
+## gen_blacklist
+# 【重写黑名单生成函数】
+# 参数：$1 userdb路径；$2 基底词库路径；$3 输出黑名单文件
+# 逻辑：
+# 1.读取基底词库，把所有词条存入awk哈希集合base_dict
+# 2.遍历userdb，解析词条、c值
+# 3.c<0，且词条不在基底集合内 → 写入黑名单；其余c<0词条保留不拉黑
+gen_blacklist() {
+    local db_path="$1"
+    local base_txt="$2"
+    local out_bl="$3"
+    awk -F'\t' -v basefile="$base_txt" '
+    BEGIN{
+        # 加载基底词库全部词条到哈希
+        while( (getline line < basefile) >0 ){
+            if(line ~ /^#/ || line == "") continue;
+            split(line, arr, "\t");
+            word = arr[1];
+            base_dict[word] = 1;
+        }
+        close(basefile);
+    }
+    /^#/{next}
+    NF<3{next}
+    {
+        word = $2;
+        split($3, arr, " ");
+        c = substr(arr[1],3)+0;
+        if(c < 0){
+            # c<0，并且不在基底词库 → 加入黑名单
+            if( ! (word in base_dict) ){
+                print word;
+            }
+        }
+    }' "$db_path" > "$out_bl"
+}
+
 ## sample_entries
 # 作用：均匀采样文本，用于脚本末尾预览词条样例
 # $1：输入文本流；$2：最多采样条数
@@ -149,21 +174,6 @@ sample_entries() {
     }'
 }
 
-## extract_negative_c_blacklist
-# 作用：解析userdb，提取c<0的词条作为黑名单
-# $1：userdb路径
-extract_negative_c_blacklist() {
-    local db_path="$1"
-    awk -F'\t' '
-    /^#/{next}
-    NF<3{next}
-    {
-        split($3, arr, " ");
-        c = substr(arr[1],3)+0;
-        if(c<0) print $2;
-    }' "$db_path"
-}
-
 ## extract_valid_rime_words
 # 作用：解析userdb，按规则筛选词条，计算原始权重分数
 # $1：userdb路径
@@ -175,7 +185,8 @@ extract_valid_rime_words() {
         -v month_sec="$PULL_COOLDOWN_SEC" \
         -v seven_sec="$SEVEN_DAY_SEC" \
         -v s_c_thr="$SINGLE_C_THRESHOLD" \
-        -v m_c_thr="$MULTI_C_THRESHOLD" '
+        -v m_c_thr="$MULTI_C_THRESHOLD" \
+        -v decay_floor="$DECAY_FLOOR" '
     {
         word = $2;
         wlen = length(word);
@@ -202,12 +213,10 @@ extract_valid_rime_words() {
         if(delta_t < seven_sec){
             local_damp = 0.4 + 0.6*(delta_t/seven_sec);
         }
-        # 30天衰减
-        decay_factor =1.0;
-        if(delta_t > month_sec){
-            decay_factor = 1.0 - 0.20 * ((delta_t - month_sec)/(3.0*month_sec));
-            if(decay_factor <0.7) decay_factor=0.7;
-        }
+        # 长期衰减【修改：下限改为0.72】
+        decay_factor = 1.0 - 0.20 * ((delta_t - month_sec)/(3.0*month_sec));
+        if(decay_factor < decay_floor) decay_factor = decay_floor;
+
         c_compress = log(c_val+1);
         len_bonus = 1 + (wlen -2)*0.12;
         raw_final = c_compress * d_val * len_bonus * local_damp * decay_factor;
@@ -282,7 +291,7 @@ merge_stream_dedup() {
     # 黑名单过滤
     local bl_cnt
     bl_cnt=$(count_lines "$bl_file")
-    if [ "$bl_cnt" -gt 0 ];then
+    if [ "$bl_cnt" -gt 0 ] && [ "$bl_cnt" -ne 0 ];then
         grep -v -f "$bl_file" .merge_max.tmp | sort -k1,1 > "$tmp_out"
     else
         sort -k1,1 .merge_max.tmp > "$tmp_out"
@@ -302,7 +311,7 @@ merge_stream_dedup() {
 main() {
     # 前置检查
     check_deps
-    # 更新子模块（冷却逻辑完全匹配你的需求）
+    # 更新子模块（冷却逻辑完全匹配需求）
     update_all_submodules
 
     # 读取installation_id
@@ -315,13 +324,14 @@ main() {
     echo "installation_id: $INSTALL_ID"
     echo "用户数据库路径: $RIME_DB"
 
-    # 生成黑名单
-    echo -e "\n🔍 提取负频次词条黑名单"
-    extract_negative_c_blacklist "$RIME_DB" > "$BLACKLIST_TMP_T"
-    cat "$BLACKLIST_TMP_T" | opencc -c t2s.json > "$BLACKLIST_TMP_S"
+    # 【修改点】生成黑名单：c<0且不在基底词库才拉黑
+    echo -e "\n🔍 生成黑名单：仅c<0且不属于基底词库的词条被剔除"
+    gen_blacklist "$RIME_DB" "$SUBMOD_T_BASE" "$BLACKLIST_TMP_T"
+    # 简体黑名单：使用简体基底词库比对
+    gen_blacklist "$RIME_DB" "$SUBMOD_S_BASE" "$BLACKLIST_TMP_S"
     local BLACK_T_COUNT
     BLACK_T_COUNT=$(count_lines "$BLACKLIST_TMP_T")
-    echo "负c黑名单词条总数：$BLACK_T_COUNT"
+    echo "本次黑名单待剔除词条总数：$BLACK_T_COUNT"
 
     # 解析用户词库，得到繁体词条流
     local NEW_RAW_RIME
@@ -360,8 +370,8 @@ main() {
     # 统计与采样预览
     echo -e "\n📊 汇总统计"
     echo "Rime提取有效词条: $NEW_RIME_COUNT"
-    echo "黑名单负频次词条: $BLACK_T_COUNT"
-    echo "权重强制区间：43 ~ 3890"
+    echo "黑名单待剔除词条: $BLACK_T_COUNT"
+    echo "权重强制区间：43 ~ 3890；长期衰减下限锁定0.72"
 
     echo -e "\n🔍 词条采样预览（最多15条）"
     echo -e "\n---繁体词条样例---"
